@@ -114,11 +114,26 @@ every Maven project ever written), but customizing anything beyond what a
 plugin already anticipated means wedging your logic into someone else's
 phase, not writing your own step.
 
-## What a goal actually is: Mojos and parameter injection
+## What a goal actually is: easing into the Mojo concept
 
-"`maven-jar-plugin:jar`" names a Java class, not a shell command. A goal
-is a **Mojo** ("Maven plain Old Java Object") — a class annotated with
-`@Mojo(name = "jar")`, whose fields are annotated with `@Parameter`:
+Step back to what a "goal" even is. Every phase in the lifecycle above is
+just a named checkpoint; the actual work happens in goals, and a goal's
+full name always has the shape `plugin-prefix:goal-name` —
+`jar:jar`, `compiler:compile`, `surefire:test`. When `mvn package` ran
+back in the first example, Maven didn't have packaging logic of its own
+to fall back on — it looked up which goal is bound to the `package`
+phase for a `jar`-packaged project (`jar:jar`, as it turns out) and ran
+exactly that.
+
+So what runs when a goal runs? Not a shell command, not a script written
+in some Maven-specific DSL — a plugin is just an ordinary jar file, and a
+goal is one specific Java class inside it. Maven's name for that class is
+a **Mojo**, a deliberately silly backronym for "**M**aven plain **O**ld
+**J**ava **O**bject," riffing on Java's well-known POJO. The name is
+doing real work as a hint: a Mojo isn't a special build-script format or
+a "task" with framework machinery wired through it — it's a class like
+any other, plus one addition, an annotation telling Maven "this class
+implements a goal, and here's its name":
 
 ```java
 @Mojo(name = "jar", defaultPhase = LifecyclePhase.PACKAGE)
@@ -224,20 +239,78 @@ single artifact, which is why the shade plugin ships relocation and
 merge-strategy configuration specifically to catch and resolve those
 collisions at build time instead of at runtime.
 
-Java 9's module system (JPMS) changes this classpath-shadowing story for
-code that opts in: a `module-info.java` declares exactly which packages a
-module exports, and the **module path** (`--module-path`, distinct from
-`-cp`) enforces strong encapsulation — two modules can't silently shadow
-each other's same-named classes, because each module's classes are only
-visible through its declared exports, not a single flat namespace. Most
-of the Maven ecosystem still builds and ships against the plain classpath
-rather than the module path — a jar with no `module-info.class` lands on
-the classpath as part of the JVM's **unnamed module**, which can read
-everything (including named modules) but exports nothing in a way other
-modules can rely on — so JPMS's stronger guarantees only actually apply
-once every jar in a dependency tree has opted in, which for most
-real-world Maven projects with dozens of third-party dependencies, still
-isn't the case a decade after Java 9 shipped.
+This flat-namespace shadowing problem — two jars, same package and class
+name, whichever loads first silently wins — isn't something Maven itself
+ever fixed. Java 9 shipped a fix at the language and JVM level instead,
+which is worth a proper detour before moving on, since it's usually
+introduced in a single confusing sentence everywhere else too.
+
+## A brief detour: what the Java module system actually is
+
+Java shipped for two decades with exactly one way to organize code above
+a single class: packages, loaded off the flat classpath just described.
+That flatness is *why* split-package shadowing is possible at all —
+nothing stops two unrelated jars from both defining a class named
+`com.example.util.Helper`, and nothing enforces that a package's
+"internal" classes stay internal. `public` was the only visibility Java
+offered above the class level, and it meant public to the entire
+classpath, not just to the callers a library author actually intended.
+
+**JPMS — the Java Platform Module System, added in Java 9 (JEP 261)** —
+is Java's answer. A `module-info.java` file at the root of a source tree
+names the module and declares, explicitly, what it needs from other
+modules and what it's willing to share:
+
+```java
+// module-info.java
+module com.example.myapp {
+    requires java.sql;
+    requires org.apache.commons.lang3;
+
+    exports com.example.myapp.api;
+    // com.example.myapp.internal is NOT exported —
+    // and now that's an enforced fact, not a naming convention
+}
+```
+
+`requires` lists the other modules this one depends on — the same
+dependency edges a POM already declares, just visible to the JVM itself
+now, not only to Maven. `exports` is the genuinely new idea: only the
+packages listed there are visible to other modules, at compile time *and*
+at runtime. Every other package in the module is invisible outside it,
+regardless of whether its classes are declared `public` — that's real
+enforcement, not documentation. A class in a non-exported package throws
+`IllegalAccessError` if another module reaches into it via reflection
+without an explicit `opens` declaration, and code outside the module
+can't even compile against it directly.
+
+Modules are consumed through a mechanism that sits *alongside* the
+classpath rather than replacing it: the **module path**
+(`--module-path`, distinct from `-cp`). A JVM launched with
+`--module-path` resolves `requires`/`exports` relationships between named
+modules instead of flattening everything into one namespace — which is
+precisely what closes the split-package hole described above: two
+modules exporting the same package name is a hard error at startup, not
+a silent, load-order-dependent shadow.
+
+None of this is retroactive, which is the detail that matters most for a
+Maven build. A jar with no `module-info.class` — the overwhelming
+majority of jars on Maven Central today — still works when placed on the
+module path, but only as an **automatic module**: Java derives a module
+name from the jar's filename and grants it (and everything else)
+unrestricted mutual visibility, forfeiting the strong encapsulation JPMS
+exists to provide. More often, such a jar never touches the module path
+at all: it lands on the plain classpath as part of the JVM's **unnamed
+module**, which behaves exactly like pre-Java-9 Java always did — full
+mutual visibility, no `requires`/`exports` enforcement, the same
+shadowing risk from before this detour. That's why "the Java module
+system" so often gets described as something the ecosystem *has* without
+*using*: the JDK itself is fully modularized internally, but JPMS's
+guarantees only apply to a dependency graph once every jar in it has
+opted in — and a decade after Java 9 shipped, most real-world Maven
+projects, with dozens of third-party dependencies rarely all published
+with `module-info.class`, still build and ship against the plain
+classpath, exactly as described earlier in this chapter.
 
 ## Transitive dependencies and "nearest wins"
 

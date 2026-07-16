@@ -29,6 +29,7 @@ nav = [
   { "npm, pnpm, and Yarn" = "npm/index.md" },
   { "Rust and Cargo" = "rust-cargo/index.md" },
   { "Python Packaging" = "python-packaging/index.md" },
+  { "Python Virtual Environments" = "python-venvs/index.md" },
   { "Dependency Resolution & SemVer" = "dependency-resolution/index.md" },
   { "CI/CD Pipelines" = "cicd-pipelines/index.md" },
   { "Debuggers" = "debuggers/index.md" },
