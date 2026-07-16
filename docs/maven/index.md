@@ -65,11 +65,68 @@ actually builds from: the **effective POM**.
 mvn help:effective-pom
 ```
 
-This is worth running on any POM that feels like it has "settings from
-nowhere" — a plugin version you never pinned, a repository you never
-declared — because the explicit file on disk is deliberately the
-*smallest* representation, not the complete one; the completeness lives
-in the merge.
+```xml
+<project>
+  <modelVersion>4.0.0</modelVersion>
+  <groupId>com.example</groupId>
+  <artifactId>my-app</artifactId>
+  <version>1.0.0</version>
+  <packaging>jar</packaging>
+
+  <build>
+    <sourceDirectory>/home/user/my-app/src/main/java</sourceDirectory>
+    <testSourceDirectory>/home/user/my-app/src/test/java</testSourceDirectory>
+    <directory>/home/user/my-app/target</directory>
+    <finalName>my-app-1.0.0</finalName>
+    <plugins>
+      <plugin>
+        <groupId>org.apache.maven.plugins</groupId>
+        <artifactId>maven-compiler-plugin</artifactId>
+        <version>3.13.0</version>
+      </plugin>
+      <plugin>
+        <groupId>org.apache.maven.plugins</groupId>
+        <artifactId>maven-jar-plugin</artifactId>
+        <version>3.4.1</version>
+        <executions>
+          <execution>
+            <id>default-jar</id>
+            <phase>package</phase>
+            <goals><goal>jar</goal></goals>
+          </execution>
+        </executions>
+      </plugin>
+      <!-- ...surefire, install, deploy, resources, and clean, each with
+           a pinned version and a default-* execution bound to its phase -->
+    </plugins>
+  </build>
+
+  <repositories>
+    <repository>
+      <id>central</id>
+      <url>https://repo.maven.apache.org/maven2</url>
+    </repository>
+  </repositories>
+
+  <dependencies>
+    <dependency>
+      <groupId>org.junit.jupiter</groupId>
+      <artifactId>junit-jupiter</artifactId>
+      <version>5.10.0</version>
+      <scope>test</scope>
+    </dependency>
+  </dependencies>
+</project>
+```
+
+None of `sourceDirectory`, the pinned plugin versions, the `default-jar`
+execution binding, or the `central` repository appear in the two-line POM
+from the first example — every one of them came from the Super POM (or,
+in a multi-module build, a `<parent>`). This is worth running on any POM
+that feels like it has "settings from nowhere" — a plugin version you
+never pinned, a repository you never declared — because the explicit
+file on disk is deliberately the *smallest* representation, not the
+complete one; the completeness lives in the merge.
 
 ## The lifecycle is fixed; plugins fill in the goals
 
@@ -199,9 +256,19 @@ line in `META-INF/MANIFEST.MF`. Maven's scope resolution above produces,
 for each phase that needs one, an ordered list of jar paths, which
 `mvn dependency:build-classpath` will print directly:
 
-```
+```sh
 mvn dependency:build-classpath -Dmdep.outputFile=cp.txt
+cat cp.txt
 ```
+
+```
+/home/user/.m2/repository/org/junit/jupiter/junit-jupiter/5.10.0/junit-jupiter-5.10.0.jar:/home/user/.m2/repository/org/junit/jupiter/junit-jupiter-api/5.10.0/junit-jupiter-api-5.10.0.jar:/home/user/.m2/repository/org/junit/jupiter/junit-jupiter-engine/5.10.0/junit-jupiter-engine-5.10.0.jar:/home/user/.m2/repository/org/opentest4j/opentest4j/1.3.0/opentest4j-1.3.0.jar
+```
+
+One flat, colon-separated line — this is the literal string that ends up
+after `java`'s `-cp` flag, junit's own transitive dependencies
+(`opentest4j`, the jupiter engine) resolved and appended right alongside
+the dependency you actually declared.
 
 The `maven-surefire-plugin` (running `mvn test`) and the `exec-maven-plugin`
 (running `mvn exec:java`) each build their own `-cp` argument this way
@@ -327,10 +394,23 @@ command that actually answers "which version am I getting and why," and
 reaching for it should be reflexive the moment two libraries need
 overlapping dependencies.
 
-```
+```sh
 mvn dependency:tree -Dverbose
 ```
 
+```
+[INFO] com.example:my-app:jar:1.0.0
+[INFO] +- com.example:library-a:jar:2.0.0:compile
+[INFO] |  \- org.apache.commons:commons-lang3:jar:3.9:compile
+[INFO] \- com.example:library-b:jar:1.5.0:compile
+[INFO]    \- (org.apache.commons:commons-lang3:jar:3.12.0:compile - omitted for conflict with 3.9)
+```
+
+`library-a` is declared first and sits at the same depth as `library-b`,
+so its `commons-lang3:3.9` is the one that's nearer by declaration order
+and wins; `3.12.0` shows up in parentheses specifically *because* of
+`-Dverbose` — without it, that line simply wouldn't be there, and the
+tree would look like `3.9` was the only version anyone ever asked for.
 The `-Dverbose` flag is what surfaces the versions that *lost* the
 resolution and why, not just the winner — without it the tree only shows
 what got resolved, which is the wrong direction to debug from when a
