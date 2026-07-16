@@ -2,9 +2,10 @@
 
 📖 **Read it here → [vivainio.github.io/sw-plumber-book](https://vivainio.github.io/sw-plumber-book/)**
 
-Notes on the build tools, dependency managers, and CI pipelines that move
-code from a source tree to a running artifact — Make, Maven, Gradle,
-MSBuild, npm, and the plumbing that connects them. The unglamorous layer
+Notes on the plumbing underneath software: build tools, dependency
+managers, and CI pipelines (Make, Maven, Gradle, MSBuild, npm), but also
+the debuggers, profilers, linkers, and OS-level machinery that let you see
+inside — and reason about — a running process. The unglamorous layer
 everyone depends on and almost nobody enjoys reading about, explained with
 real examples instead of marketing copy.
 

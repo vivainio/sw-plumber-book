@@ -6,7 +6,7 @@
 [project]
 
 site_name = "Software Plumbers"
-site_description = "The pipes that move code from source tree to running artifact."
+site_description = "The plumbing underneath software: build systems, debuggers, profilers, and the runtime machinery nobody talks about."
 site_author = "Ville Vainio"
 site_url = "https://vivainio.github.io/sw-plumber-book/"
 
@@ -24,10 +24,15 @@ nav = [
   { "Make" = "make/index.md" },
   { "Maven" = "maven/index.md" },
   { "Gradle" = "gradle/index.md" },
+  { "Bazel" = "bazel/index.md" },
   { "MSBuild" = "msbuild/index.md" },
   { "npm, pnpm, and Yarn" = "npm/index.md" },
+  { "Rust and Cargo" = "rust-cargo/index.md" },
+  { "Python Packaging" = "python-packaging/index.md" },
   { "Dependency Resolution & SemVer" = "dependency-resolution/index.md" },
   { "CI/CD Pipelines" = "cicd-pipelines/index.md" },
+  { "Debuggers" = "debuggers/index.md" },
+  { "Containers" = "containers/index.md" },
 ]
 
 extra_css = ["stylesheets/extra.css"]

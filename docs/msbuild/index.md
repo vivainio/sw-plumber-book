@@ -48,6 +48,84 @@ later: implicit defaults instead of explicit line-by-line declarations,
 with an escape hatch (adding `<ItemGroup>`/`<PropertyGroup>` entries) for
 anything the default doesn't cover.
 
+## An "SDK" is just more MSBuild, stacked
+
+`Sdk="Microsoft.NET.Sdk"` doesn't select a compiler or a runtime — it
+resolves to a directory (shipped with the .NET SDK, or fetched as a
+NuGet package for other SDKs) containing plain `.props` and `.targets`
+files, imported at the very start and very end of your project file
+respectively:
+
+```
+Sdk.props   →  <your .csproj content>  →  Sdk.targets
+```
+
+`Sdk.props`, evaluated first, sets defaults your file can still override
+(default output paths, default language version, the implicit item
+globs for `.cs` files). `Sdk.targets`, imported last, defines the actual
+`Compile`, `Build`, and `Publish` targets that do the work, wired up via
+`BeforeTargets`/`AfterTargets`/`DependsOnTargets` hooks that your own
+project-level targets can slot into. There is no separate "SDK engine" —
+`Microsoft.NET.Sdk` is authored in exactly the XML this chapter has been
+showing, just a great deal more of it, and reading it (it lives under the
+installed SDK's `Sdks/Microsoft.NET.Sdk/Sdks` or `.../targets` folders) is
+a legitimate way to answer "where does this default actually come from,"
+the same way `mvn help:effective-pom` answers it for Maven.
+
+This is also why there are so many different `Sdk=` values —
+`Microsoft.NET.Sdk.Web`, `Microsoft.NET.Sdk.Razor`,
+`Microsoft.NET.Sdk.BlazorWebAssembly`, `Microsoft.NET.Sdk.Worker`,
+`Microsoft.NET.Sdk.WindowsDesktop` (WPF/WinForms) — each is its own
+NuGet-distributed stack of `.props`/`.targets`, and most of them work by
+importing `Microsoft.NET.Sdk` themselves and layering additional targets
+on top, rather than reimplementing project building from scratch. A
+Blazor WebAssembly project is, mechanically, an ordinary SDK-style .NET
+project plus an extra import that adds targets for producing a
+`_framework/` folder of WASM-runnable assemblies — "SDK" here means
+"a reusable pile of MSBuild logic packaged like a library," not a
+separate build system underneath the one this chapter describes.
+
+## Tracing the implicit glob to its actual source
+
+The claim above — "C# files are included by default via a glob" — isn't
+hand-waving; it's one specific `ItemGroup`, in one specific file, shipped
+with the SDK. On this machine (.NET SDK 10.0.101) it's
+`Sdks/Microsoft.NET.Sdk/targets/Microsoft.NET.Sdk.DefaultItems.props`:
+
+```xml
+<ItemGroup Condition=" '$(EnableDefaultItems)' == 'true' ">
+  <Compile Include="**/*$(DefaultLanguageSourceExtension)"
+           Exclude="$(DefaultItemExcludes);$(DefaultExcludesInProjectFolder)"
+           Condition=" '$(EnableDefaultCompileItems)' == 'true' " />
+  ...
+</ItemGroup>
+```
+
+`$(DefaultLanguageSourceExtension)` is `.cs` for the C# SDK (`.vb`/`.fs` for
+the others) — this line is the entire "why does adding a `.cs` file to the
+folder just work" mechanism, no IDE magic involved, and it's disableable
+per-project with `<EnableDefaultCompileItems>false</EnableDefaultCompileItems>`
+for anyone who wants the pre-2017-style explicit `<Compile Include>` list
+back.
+
+`$(DefaultItemExcludes)` is worth following too, since it's assembled
+piecemeal across several `.targets` files and explains a recurring "why
+isn't my file compiling" report. The entry that matters most lives in
+`Microsoft.NET.DefaultOutputPaths.targets`:
+
+```xml
+<DefaultItemExcludes>$(DefaultItemExcludes);bin/**;obj/**</DefaultItemExcludes>
+```
+
+`bin/` and `obj/` are excluded from every implicit glob, on purpose —
+without this, a build would glob-include its own previous output back into
+the *next* compile, including generated `.cs` files MSBuild itself writes
+into `obj/`. It's also why copying or extracting a stray `.cs` file into
+`bin/`/`obj/` (an easy mistake in a script that shells out to the build)
+silently produces a file that never compiles: not a bug in the glob,
+working exactly as specified, just non-obvious until this file has been
+read once.
+
 ## Properties, items, targets, tasks — the four building blocks
 
 Everything in MSBuild is one of these:
@@ -77,6 +155,37 @@ it lets you hook into a target defined somewhere in an imported `.targets`
 file you've never opened, which is both the main way people customize a
 .NET build and the main way two unrelated NuGet packages' `BeforeTargets`
 hooks end up firing in an order nobody explicitly chose.
+
+## Two phases: evaluation, then execution
+
+MSBuild processes a project in two strictly separated passes, and most
+"why did my property/item not take effect" confusion comes from not
+knowing which pass you're editing.
+
+**Evaluation** runs first, top to bottom, through the project file and
+every file it `<Import>`s: properties are assigned in document order,
+item globs (`<Compile Include="**/*.cs" />`) are expanded against the
+filesystem as they're encountered, and `Condition` attributes are
+evaluated using whatever property values exist *at that point in the
+file*. Nothing here runs a target or a task — it's pure data assembly,
+building up the in-memory property and item tables that targets will read
+from later.
+
+**Execution** runs second: MSBuild determines which targets to run and in
+what order (from `DependsOnTargets`, `BeforeTargets`, `AfterTargets`, and
+the target(s) requested on the command line), then runs their tasks in
+order, in a single pass over the *already-evaluated* property and item
+values.
+
+The consequence that catches people: a `<PropertyGroup>` or item
+modification written *inside a target* only exists during execution and
+cannot retroactively change an item glob that was expanded during
+evaluation, even though both look like ordinary XML sitting in the same
+file. Setting `<DefineConstants>FOO</DefineConstants>` inside a target
+that's supposed to affect compilation is a common version of this bug —
+by the time that target runs, the `Csc` task's inputs were already
+computed from evaluation-time property values, so the change either does
+nothing or requires an explicit item re-evaluation to pick up.
 
 ## Targets form a graph too — just via imports, not a single file
 
@@ -112,6 +221,204 @@ target for every file:
 with the least direct equivalent in Make, Maven, or Gradle: those systems
 mostly bind behavior to file *type* or *task type*; MSBuild lets a single
 file carry its own build instructions inline.
+
+## PackageReference, traced from XML to compiler argument
+
+`<PackageReference Include="Newtonsoft.Json" Version="13.0.3" />` doesn't
+turn into a compiler argument directly — there's a concrete multi-step
+pipeline between them, spread across a restore step and a build step that
+only agree via a file on disk, and every step of it is inspectable.
+
+**1. `dotnet restore` resolves the dependency graph and writes it to
+`obj/project.assets.json`** — not just to the NuGet cache. It's a JSON map
+from every resolved package to the actual files it contributes for each
+purpose (compile-time reference, runtime asset, build-time `.targets`,
+analyzer, ...). For the package above, restored for real, the relevant
+slice is:
+
+```json
+"targets": {
+  "net10.0": {
+    "Newtonsoft.Json/13.0.3": {
+      "type": "package",
+      "compile": {
+        "lib/net6.0/Newtonsoft.Json.dll": { "related": ".xml" }
+      },
+      "runtime": {
+        "lib/net6.0/Newtonsoft.Json.dll": { "related": ".xml" }
+      }
+    }
+  }
+}
+```
+
+**2. The `ResolvePackageAssets` task reads that file back during build** —
+a separate MSBuild invocation from restore, wired up in
+`Microsoft.PackageDependencyResolution.targets`. Its `CompileTimeAssemblies`
+output — one entry per `"compile"` entry above — becomes the
+`ResolvedCompileFileDefinitions` item list.
+
+**3. `ResolveLockFileReferences` folds those into ordinary `@(Reference)`
+items** — the same item type a hand-written `<Reference Include="System.Xml"
+/>` produces, carrying a `HintPath` metadata value that points at the actual
+DLL on disk. Dropping a one-line diagnostic target into a throwaway project
+confirms the whole chain end to end:
+
+```xml
+<Target Name="PrintReferences" AfterTargets="ResolveLockFileReferences">
+  <Message Text="REF: %(Reference.Identity) HintPath=%(Reference.HintPath)" Importance="high" />
+</Target>
+```
+
+```
+REF: /home/.../.nuget/packages/newtonsoft.json/13.0.3/lib/net6.0/Newtonsoft.Json.dll
+     HintPath=/home/.../.nuget/packages/newtonsoft.json/13.0.3/lib/net6.0/Newtonsoft.Json.dll
+```
+
+— resolved straight into the shared package cache under `~/.nuget/packages/`,
+with no copy into the project folder. `Csc` then reads `@(Reference)` like
+any other input item, with no idea that some entries came from a NuGet
+package and others from a hand-written `<Reference>` element — by the time
+compilation runs, that distinction is already gone. This is also the answer
+to "how can a build compile against a dependency without `dotnet restore`
+ever copying a file into the repo": it doesn't need to. MSBuild references
+packages in place from the global cache; `project.assets.json` is just the
+map that tells it where.
+
+## MSBuild as a small programming language, not just config
+
+XML syntax hides it, but MSBuild has real expression evaluation baked
+into `$()` and `@()`, enough that project authors write actual logic
+without ever leaving project-file syntax.
+
+**Property functions** call real .NET static or instance methods
+directly from a property expression:
+
+```xml
+<PropertyGroup>
+  <BuildTimestamp>$([System.DateTime]::Now.ToString("yyyyMMdd"))</BuildTimestamp>
+  <IsRelease>$(Configuration.ToUpperInvariant() == 'RELEASE')</IsRelease>
+</PropertyGroup>
+```
+
+`$([System.DateTime]::Now...)` is calling into the BCL from inside an XML
+attribute — a deliberately whitelisted set of "safe" types and methods,
+not arbitrary reflection, but real method calls with real return values
+nonetheless.
+
+**Item functions and transforms** do the equivalent for lists — filter,
+dedupe, reshape:
+
+```xml
+<ItemGroup>
+  <UniqueExtensions Include="@(Compile->'%(Extension)'->Distinct())" />
+</ItemGroup>
+```
+
+`->'%(Extension)'` transforms each item to just its extension metadata;
+`->Distinct()` then dedupes the resulting list — a small pipeline of list
+operations, expressed inline, doing in one line what would otherwise need
+a custom task.
+
+And for logic too involved for expressions, **`UsingTask` with
+`RoslynCodeTaskFactory`** lets a project file define a task as inline C#,
+compiled on the fly the first time it's used:
+
+```xml
+<UsingTask TaskName="DoubleNumber" TaskFactory="RoslynCodeTaskFactory"
+           AssemblyFile="$(RoslynTargetsPath)\Microsoft.Build.Tasks.CodeTaskFactory.dll">
+  <ParameterGroup>
+    <Input ParameterType="System.Int32" Required="true" />
+    <Output ParameterType="System.Int32" Output="true" />
+  </ParameterGroup>
+  <Task>
+    <Code Type="Fragment" Language="cs">
+      Output = Input * 2;
+    </Code>
+  </Task>
+</UsingTask>
+```
+
+Put together, these three mechanisms are why a "just a config file" format
+regularly ends up hosting real conditional logic, string manipulation, and
+even inline compiled code. A custom build step in MSBuild isn't only a
+prebuilt task DLL loaded via `UsingTask AssemblyFile=...` — it can be C#
+written directly in the project file, with no separate task project,
+build, or publish step at all.
+
+## Incremental targets: MSBuild's own timestamp check
+
+MSBuild's built-in targets (`Build`, `Compile`, etc.) don't recompile
+everything on every invocation, and the mechanism is Make's, transplanted
+almost unchanged: a `Target` can declare `Inputs` and `Outputs`, and if
+every file in `Outputs` is newer than every file in `Inputs`, MSBuild
+skips the target's tasks entirely and logs `Skipping target "X" because
+all output files are up-to-date`.
+
+```xml
+<Target Name="GenerateVersionFile"
+        Inputs="$(MSBuildProjectFile)"
+        Outputs="$(IntermediateOutputPath)version.g.cs">
+  <WriteLinesToFile File="$(IntermediateOutputPath)version.g.cs"
+                     Lines="// $(Version)" Overwrite="true" />
+</Target>
+```
+
+This is exactly the timestamp-comparison model the Make chapter describes
+— with the same failure mode: a build step that writes an output whose
+declared `Inputs` don't actually capture everything the task body reads
+(an environment variable, a file the task opens without declaring it)
+will go stale silently, because MSBuild only ever compares the files it
+was told about. `dotnet build -v:detailed` surfaces the up-to-date check
+MSBuild actually performed, which is the direct way to confirm whether a
+suspiciously-fast build skipped real work or genuinely had nothing to do.
+
+## Batching: one target, secretly many invocations
+
+Referencing an item's metadata with `%()` instead of `@()` inside a task
+doesn't just read a value — it triggers **batching**: MSBuild groups the
+item list into buckets with identical metadata values and runs the
+containing task (or, if the reference is on the `Target` element itself,
+the whole target) once per bucket, not once total.
+
+```xml
+<Copy SourceFiles="@(Content)"
+      DestinationFolder="$(OutDir)%(Content.RelativeDir)" />
+```
+
+Because `%(Content.RelativeDir)` differs per file, this single `<Copy>`
+element actually executes once per distinct destination directory, each
+invocation handling only the items sharing that value — not one `Copy`
+call per file, and not one call for everything at once either. This is
+usually invisible, because it produces the result people already expect
+("preserve relative paths on copy"), but it's the mechanism behind two
+recurring surprises: a task that appears to run "more than once" in a
+verbose log with no corresponding loop anywhere in the XML, and a task
+that's supposed to batch (see all items at once, e.g. to produce a single
+combined output) but was accidentally written with `%()` instead of `@()`
+and now runs once per item instead.
+
+## Building many projects at once: `/m` and the project graph
+
+A solution isn't one MSBuild evaluation — it's many `.csproj` files, each
+its own independent evaluation/execution pass, linked by
+`<ProjectReference>` items that tell MSBuild which other projects need to
+build first. `dotnet build` on a solution (or `msbuild -m`) builds this
+project-level graph in parallel: `-m` (or `-maxCpuCount`) spins up
+multiple MSBuild worker nodes, and independent projects — ones without a
+`ProjectReference` path between them — build concurrently, each in its
+own node/process.
+
+This is a second, coarser dependency graph sitting above the
+target-level graph described earlier, and the two are easy to conflate:
+a `ProjectReference` guarantees project B finishes building before
+project A starts (so A can reference B's output DLL), but says nothing
+about ordering *within* either project's own targets. It's also where
+custom tasks that rely on process-wide static state get quietly broken —
+a task that stashes something in a static field expecting a later target
+in the *same build* to read it can end up running in a different node
+process entirely once `/m` parallelizes across projects, with no shared
+memory between them.
 
 ## dotnet build vs. dotnet publish vs. MSBuild directly
 
