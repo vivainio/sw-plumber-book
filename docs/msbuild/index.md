@@ -178,14 +178,41 @@ order, in a single pass over the *already-evaluated* property and item
 values.
 
 The consequence that catches people: a `<PropertyGroup>` or item
-modification written *inside a target* only exists during execution and
-cannot retroactively change an item glob that was expanded during
-evaluation, even though both look like ordinary XML sitting in the same
-file. Setting `<DefineConstants>FOO</DefineConstants>` inside a target
-that's supposed to affect compilation is a common version of this bug —
-by the time that target runs, the `Csc` task's inputs were already
-computed from evaluation-time property values, so the change either does
-nothing or requires an explicit item re-evaluation to pick up.
+modification written *inside a target* only exists during execution, and
+can't retroactively change something whose value was already locked in
+during evaluation, even though both look like ordinary XML sitting in the
+same file:
+
+```xml
+<PropertyGroup>
+  <IncludeExtra>false</IncludeExtra>
+</PropertyGroup>
+
+<ItemGroup>
+  <Compile Include="Extra.cs" Condition="'$(IncludeExtra)' == 'true'" />
+</ItemGroup>
+
+<Target Name="EnableExtra" BeforeTargets="Build">
+  <PropertyGroup>
+    <IncludeExtra>true</IncludeExtra>
+  </PropertyGroup>
+</Target>
+```
+
+This looks like it should include `Extra.cs`: `EnableExtra` sets
+`IncludeExtra` to `true`, and `BeforeTargets="Build"` guarantees it runs
+before the build proper starts. It doesn't. The `Compile` item's
+`Condition` was already evaluated, against `IncludeExtra`'s
+document-order value of `false`, during the evaluation pass — before any
+target, including `EnableExtra`, has run at all. `Extra.cs` is
+permanently absent from `@(Compile)` for this build, and nothing in a
+normal build log calls that out as a mistake, because as far as
+evaluation was concerned, the condition was simply false. The fix isn't
+a different target hook — it's moving `IncludeExtra`'s real value
+somewhere evaluation can see it before the item is expanded (a
+`-property:IncludeExtra=true` command-line switch, or an `<Import>`
+ordered earlier in the file), because no `BeforeTargets` placement can
+run early enough to matter.
 
 ## Targets form a graph too — just via imports, not a single file
 
@@ -364,6 +391,23 @@ all output files are up-to-date`.
 </Target>
 ```
 
+Running the same build twice in a row, with `dotnet build -v:detailed`,
+shows exactly this decision being made and logged:
+
+```
+Building target "GenerateVersionFile" completely.
+Input file "MyApp.csproj" is newer than output file "obj/Debug/net8.0/version.g.cs".
+
+Skipping target "GenerateVersionFile" because all output files are up-to-date
+with respect to the input files.
+```
+
+First run: the output doesn't exist yet, so the target runs in full.
+Second run, nothing touched: `-v:detailed` logs the exact
+newer-than-comparison MSBuild made and the target is skipped entirely —
+no `WriteLinesToFile` task execution, no timestamp change on
+`version.g.cs`.
+
 This is exactly the timestamp-comparison model the Make chapter describes
 — with the same failure mode: a build step that writes an output whose
 declared `Inputs` don't actually capture everything the task body reads
@@ -389,10 +433,29 @@ the whole target) once per bucket, not once total.
 Because `%(Content.RelativeDir)` differs per file, this single `<Copy>`
 element actually executes once per distinct destination directory, each
 invocation handling only the items sharing that value — not one `Copy`
-call per file, and not one call for everything at once either. This is
-usually invisible, because it produces the result people already expect
-("preserve relative paths on copy"), but it's the mechanism behind two
-recurring surprises: a task that appears to run "more than once" in a
+call per file, and not one call for everything at once either. Given
+three `Content` items — `config.json` at the project root, and
+`icon.png`/`banner.png` both under `assets/` — a verbose build log shows
+this one XML element firing as two separate `Copy` invocations, not
+three and not one:
+
+```
+Task "Copy"
+  Copying file from "config.json" to "bin/Debug/net8.0/config.json".
+Done executing task "Copy".
+
+Task "Copy"
+  Copying file from "assets/icon.png" to "bin/Debug/net8.0/assets/icon.png".
+  Copying file from "assets/banner.png" to "bin/Debug/net8.0/assets/banner.png".
+Done executing task "Copy".
+```
+
+One bucket per distinct `RelativeDir` value — the empty string, and
+`assets\` — with both `assets/` files landing in the *same* invocation
+because they share a bucket, while the root-level file gets its own.
+This is usually invisible, because it produces the result people already
+expect ("preserve relative paths on copy"), but it's the mechanism behind
+two recurring surprises: a task that appears to run "more than once" in a
 verbose log with no corresponding loop anywhere in the XML, and a task
 that's supposed to batch (see all items at once, e.g. to produce a single
 combined output) but was accidentally written with `%()` instead of `@()`
@@ -446,21 +509,73 @@ developers never need to know MSBuild's own command-line syntax at all.
 
 - **Multi-targeting and conditional items.** A library targeting both
   `net8.0` and `netstandard2.0` uses `<TargetFrameworks>` (plural) plus
-  `Condition="'$(TargetFramework)' == 'net8.0'"` on items or
-  `PackageReference`s that only apply to one target. Forgetting the
-  condition on a framework-specific package reference is a build that
-  succeeds for one target and fails to restore, or worse, compiles with the
-  wrong API surface, for the other.
+  a `Condition` on items or `PackageReference`s that only apply to one
+  target:
+
+  ```xml
+  <PropertyGroup>
+    <TargetFrameworks>net8.0;netstandard2.0</TargetFrameworks>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="System.Text.Json" Version="8.0.0"
+                       Condition="'$(TargetFramework)' == 'netstandard2.0'" />
+  </ItemGroup>
+  ```
+
+  Forgetting the `Condition` on a framework-specific package reference —
+  because `System.Text.Json` ships built into the runtime from `net8.0`
+  onward, but not on `netstandard2.0` — is a build that succeeds for one
+  target and fails to restore, or worse, compiles with the wrong API
+  surface, for the other. Each `TargetFramework` in the list gets its own
+  full evaluation pass, so a `Condition` typo'd against the wrong TFM
+  string doesn't error, it just silently never matches.
+
 - **Central Package Management** (`Directory.Packages.props`) moving
   version numbers out of individual `.csproj` files is MSBuild's answer to
   the same problem Maven's `<dependencyManagement>` solves — a shared
-  version pin across many projects — and it's easy to half-migrate a
-  solution, leaving some projects still specifying their own `Version` on
-  `PackageReference`, which silently overrides the central pin rather than
-  erroring.
+  version pin across many projects:
+
+  ```xml
+  <!-- Directory.Packages.props, at the repo root -->
+  <Project>
+    <PropertyGroup>
+      <ManagePackageVersionsCentrally>true</ManagePackageVersionsCentrally>
+    </PropertyGroup>
+    <ItemGroup>
+      <PackageVersion Include="Newtonsoft.Json" Version="13.0.3" />
+    </ItemGroup>
+  </Project>
+  ```
+
+  ```xml
+  <!-- some-project.csproj — no Version attribute, it comes from above -->
+  <PackageReference Include="Newtonsoft.Json" />
+  ```
+
+  It's easy to half-migrate a solution, leaving some projects still
+  specifying their own `Version` on `PackageReference` — MSBuild doesn't
+  reject that as a conflict, it silently lets the per-project `Version`
+  override the central pin, which defeats the entire point of centralizing
+  it in the first place without ever raising an error.
 - **`Directory.Build.props`/`Directory.Build.targets`** are auto-imported by
   every project below them in the directory tree, with no explicit
-  `<Import>` needed — genuinely useful for repo-wide settings, and a common
-  source of "why does this property have a value I never set in this
-  project" the first time someone encounters one three directories up from
-  the `.csproj` they're actually looking at.
+  `<Import>` needed:
+
+  ```xml
+  <!-- repo-root/Directory.Build.props -->
+  <Project>
+    <PropertyGroup>
+      <Nullable>enable</Nullable>
+      <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
+    </PropertyGroup>
+  </Project>
+  ```
+
+  Every `.csproj` in every subfolder underneath `repo-root/` picks up
+  `Nullable`/`TreatWarningsAsErrors` automatically — genuinely useful for
+  repo-wide settings, and a common source of "why does this property have
+  a value I never set in this project" the first time someone encounters
+  one three directories up from the `.csproj` they're actually looking at,
+  since there's no `<Import>` line in the project file itself pointing
+  back to it.
