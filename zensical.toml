@@ -34,6 +34,15 @@ nav = [
   { "CI/CD Pipelines" = "cicd-pipelines/index.md" },
   { "Debuggers" = "debuggers/index.md" },
   { "Containers" = "containers/index.md" },
+  { "OpenTelemetry" = [
+      "opentelemetry/index.md",
+      { "Traces and Context Propagation" = "opentelemetry/traces-and-context.md" },
+      { "The OTLP Wire Protocol" = "opentelemetry/otlp-protocol.md" },
+      { "Metrics and Logs" = "opentelemetry/metrics-and-logs.md" },
+      { "SDK Pipeline and the Collector" = "opentelemetry/sdk-and-collector.md" },
+      { "Auto-Instrumentation and Debugging the Pipeline" = "opentelemetry/instrumentation-and-debugging.md" },
+    ]
+  },
 ]
 
 extra_css = ["stylesheets/extra.css"]
