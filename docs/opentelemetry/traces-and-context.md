@@ -96,6 +96,81 @@ instrumentation library (or your own code) has to explicitly inject
 the consumer side; nothing does this automatically the way an HTTP client
 interceptor does.
 
+## A worked example: relaying context through SQS
+
+SQS makes a good example precisely because it has no concept of
+"headers." A message is a body plus up to ten **MessageAttributes**,
+each an explicit `{DataType, StringValue}` pair the sender constructs by
+hand — there's no interceptor sitting between application code and the
+socket the way there is for an HTTP client. So the producer injects the
+current context into a plain `dict` (a `TextMapPropagator`'s carrier is
+just `Mapping[str, str]` with `__setitem__`/`__getitem__`, which is why
+the same API works whether the carrier ends up as HTTP headers or SQS
+attributes) and copies that dict into `MessageAttributes`:
+
+```python
+import boto3
+from opentelemetry import trace, propagate
+
+sqs = boto3.client("sqs")
+tracer = trace.get_tracer(__name__)
+
+def publish_order_created(queue_url: str, body: str) -> None:
+    with tracer.start_as_current_span(
+        "orders.publish", kind=trace.SpanKind.PRODUCER
+    ):
+        carrier: dict[str, str] = {}
+        propagate.inject(carrier)  # writes traceparent (+ tracestate, baggage)
+
+        sqs.send_message(
+            QueueUrl=queue_url,
+            MessageBody=body,
+            MessageAttributes={
+                key: {"DataType": "String", "StringValue": value}
+                for key, value in carrier.items()
+            },
+        )
+```
+
+The consumer does the reverse: pull the attributes back into a carrier
+dict, extract a `Context` from it, and pass that context in explicitly
+when starting the span, rather than letting it default to "whatever's
+current" (which, in a poll loop, is nothing related to the message at
+all):
+
+```python
+def handle_message(message: dict) -> None:
+    carrier = {
+        key: attr["StringValue"]
+        for key, attr in message.get("MessageAttributes", {}).items()
+    }
+    ctx = propagate.extract(carrier)  # Context with the producer's span as parent
+
+    with tracer.start_as_current_span(
+        "orders.process", context=ctx, kind=trace.SpanKind.CONSUMER
+    ):
+        ...  # process the order
+```
+
+Two SQS-specific ways this silently fails, distinct from the general
+"forgot to propagate" case above:
+
+- **`receive_message` doesn't return attributes by default.** Without
+  `MessageAttributeNames=["All"]` (or the specific names) on the receive
+  call, `message["MessageAttributes"]` is simply absent — `extract()`
+  gets an empty carrier, produces no parent, and every consumed message
+  quietly starts a brand-new root trace. This looks identical to "the
+  producer never injected anything," so check the receive call first.
+- **The propagator has to match on both ends.** `propagate.inject`/
+  `extract` use whatever's configured via `OTEL_PROPAGATORS` (default
+  `tracecontext,baggage`, i.e. W3C). If the consumer is a Lambda with
+  X-Ray active tracing, or anything else on AWS's own tracing stack, it
+  may be reading `X-Amzn-Trace-Id` instead — a different format under a
+  different attribute key — which needs the separate
+  `opentelemetry-propagator-aws-xray` propagator on *both* sides to
+  bridge the two. A W3C producer and an X-Ray-only consumer will each
+  succeed at their own inject/extract call and still never link up.
+
 ## Sampling: deciding what to keep, and when
 
 Recording every span for every request is often too expensive, so
