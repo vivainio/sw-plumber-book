@@ -39,9 +39,14 @@ parent.
 The hard problem tracing actually solves is **context propagation**:
 service A starts a span, calls service B over HTTP, and B needs to
 continue the *same* trace rather than start a new one. OpenTelemetry
-doesn't invent its own header for this — it implements the W3C **Trace
-Context** standard, so a `traceparent` header rides along on the outbound
-request:
+doesn't invent its own header for this — it implements
+[**W3C Trace Context**](https://www.w3.org/TR/trace-context/), a W3C
+Recommendation (finalized 2020) that predates and is independent of
+OpenTelemetry itself — Trace Context defines the header format, and any
+tracing system is free to implement it, which is exactly why a request
+can hop through OpenTelemetry-instrumented and non-OpenTelemetry
+services alike without losing its trace ID. So a `traceparent` header
+rides along on the outbound request:
 
 ```
 traceparent: 00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01
@@ -56,13 +61,18 @@ new root span, starts a child span whose `parent_span_id` is the
 spans into one trace without either side needing to know the other's
 implementation.
 
-Two companion headers ride along the same hop:
+Two companion headers ride along the same hop, and only one of them comes
+from the same spec:
 
-- **`tracestate`** carries vendor-specific extra state through the same
+- **`tracestate`** is defined by Trace Context itself, alongside
+  `traceparent`, and carries vendor-specific extra state through the same
   hop without OpenTelemetry needing to understand its contents —
   `tracestate: congo=t61rcWkgMzE,rojo=00f067aa0ba902b7`, a comma-separated
   list of `key=value` pairs each vendor owns.
-- **`baggage`** propagates arbitrary user-defined key/value pairs —
+- **`baggage`** is a *separate* W3C specification,
+  [**W3C Baggage**](https://www.w3.org/TR/baggage/), not part of Trace
+  Context — it just happens to travel alongside it in practice. It
+  propagates arbitrary user-defined key/value pairs —
   `baggage: user.tier=gold,tenant.id=42` — the same way. Baggage is *not*
   attached to spans automatically; it's just carried along in-process and
   across hops, readable by any downstream instrumentation that chooses to
