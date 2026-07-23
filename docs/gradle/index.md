@@ -46,6 +46,70 @@ just tasks with `dependsOn` edges like any other, which means you can insert
 your own task into that graph the same way the plugin authors did, not by
 fighting a fixed lifecycle.
 
+In a real project, use the checked-in wrapper rather than whichever Gradle
+happens to be installed on the machine:
+
+```console
+$ ./gradlew goodbye --dry-run
+:hello SKIPPED
+:goodbye SKIPPED
+
+$ ./gradlew goodbye
+
+> Task :hello
+Hello from Gradle
+
+> Task :goodbye
+Goodbye
+```
+
+`SKIPPED` here does not mean the task would be omitted from a real build.
+`--dry-run` is showing the selected tasks in execution order while
+deliberately skipping their actions. The leading colon is the task's
+fully-qualified path: in a multi-project build, `:app:test` and
+`:library:test` are different tasks even though both have the short name
+`test`.
+
+## Three phases: the source of many Gradle surprises
+
+A Gradle invocation has three conceptually separate phases:
+
+1. **Initialization** discovers the build and its included projects, starting
+   with `settings.gradle.kts`.
+2. **Configuration** evaluates build scripts and constructs/configures the task
+   graph.
+3. **Execution** runs the actions of the selected tasks.
+
+Code in a task's configuration block is not the task's work. It runs while
+Gradle is configuring the build. The work belongs in `doFirst`, `doLast`, or
+an action on a custom task type:
+
+```kotlin
+println("configuring the build")
+
+tasks.register("demonstrate") {
+    println("configuring :demonstrate")
+    doLast {
+        println("executing :demonstrate")
+    }
+}
+```
+
+```console
+$ ./gradlew demonstrate
+configuring the build
+configuring :demonstrate
+
+> Task :demonstrate
+executing :demonstrate
+```
+
+This distinction explains the classic "why did that code run when I asked
+for a different task?" bug: a file read, network request, or `println` placed
+directly in configuration code can happen before Gradle has executed any
+task. `tasks.register` supports lazy task creation, but its configuration
+still needs to remain configuration rather than hidden work.
+
 ## Groovy and Kotlin DSL: it's a real language, which cuts both ways
 
 A `build.gradle.kts` file is Kotlin. This is Gradle's biggest structural
@@ -99,6 +163,27 @@ it never declared via `inputs`, Gradle has no way to know that value
 changed, and will happily report `UP-TO-DATE` on a build that's actually
 stale.
 
+The status words in normal output tell you *why* work did or did not happen:
+
+```console
+$ ./gradlew generateReport
+> Task :generateReport
+
+$ ./gradlew generateReport
+> Task :generateReport UP-TO-DATE
+
+$ ./gradlew generateReport --rerun-tasks
+> Task :generateReport
+```
+
+Other common statuses are `NO-SOURCE` (the task had no source files),
+`SKIPPED` (for example, an `onlyIf` predicate rejected it), and `FROM-CACHE`
+(Gradle restored the outputs rather than executing the task). If a task is
+unexpectedly up to date, `--info` is the first useful level of extra output.
+If it reruns unexpectedly, look for an input value or input file that Gradle
+says changed; volatile generated files, absolute paths, and environment
+values accidentally modeled as inputs are frequent causes.
+
 ## The build cache goes further: it's not even about *this* machine
 
 Incremental builds skip work within one build directory. The **build
@@ -119,12 +204,93 @@ metadata and a warmed-up JIT between builds, instead of every `gradle`
 invocation cold-starting a fresh JVM. This is the single biggest reason
 Gradle's second build of a session feels dramatically faster than its
 first — it's not incrementality, it's avoiding JVM startup and
-classloading twice. It's also the source of a specific, recurring debugging
-dead end: a build behaving differently than expected after changing a
-plugin version or an environment variable, where the fix is `gradle
---stop` to kill the daemon and force a clean process, because the running
-daemon cached something (a plugin class, a stale environment snapshot) from
-before the change.
+classloading twice. `./gradlew --status` lists compatible daemons and
+`./gradlew --stop` stops them. Restarting the daemon is a useful diagnostic
+when investigating process-level state, file locks, or memory pressure, but
+it should not be the routine fix for an incorrectly modeled build: if a task
+uses a value that affects its output, that value belongs in the task's
+declared inputs.
+
+## Dependencies live in configurations
+
+The word "dependency" is overloaded in Gradle. `dependsOn` creates an edge
+between *tasks*. Library dependencies such as `org.slf4j:slf4j-api` live in
+named **configurations**—sets of dependencies with a purpose such as
+compilation or runtime:
+
+```kotlin
+dependencies {
+    implementation("org.slf4j:slf4j-api:2.0.17")
+    testImplementation("org.junit.jupiter:junit-jupiter:5.13.4")
+}
+```
+
+The Java plugin supplies names such as `implementation`,
+`testImplementation`, `compileClasspath`, and `runtimeClasspath`.
+`implementation` is where you declare a direct dependency;
+`compileClasspath` is a resolvable view Gradle derives from declarations.
+Keeping those roles separate matters in custom build logic: a bucket people
+declare into is not necessarily a configuration you should resolve.
+
+When the selected version is surprising, inspect the resolved graph rather
+than reading the build file harder:
+
+```console
+$ ./gradlew dependencies --configuration runtimeClasspath
+
+$ ./gradlew dependencyInsight \
+    --dependency slf4j-api \
+    --configuration runtimeClasspath
+org.slf4j:slf4j-api:2.0.17
+   Selection reasons:
+      - By conflict resolution: between versions 2.0.17 and 1.7.36
+```
+
+`dependencies` answers "what is in this configuration?" while
+`dependencyInsight` answers "why did this particular component and version
+win?" That second question is usually the useful one in a conflict.
+
+## Multi-project builds: paths make the graph unambiguous
+
+`settings.gradle.kts` defines which projects participate:
+
+```kotlin
+rootProject.name = "shop"
+include("app", "pricing")
+```
+
+One project can depend on another's produced library:
+
+```kotlin
+// app/build.gradle.kts
+dependencies {
+    implementation(project(":pricing"))
+}
+```
+
+This is not the same as `tasks.named("compileJava") {
+dependsOn(":pricing:compileJava") }`. A project dependency carries the
+artifact and usage information Gradle needs and lets the Java plugins infer
+the appropriate task edges. A hand-written task dependency merely orders
+two tasks; it does not put `pricing` on `app`'s classpath.
+
+## A compact debugging sequence
+
+When a Gradle build is opaque, narrow the question in this order:
+
+```console
+./gradlew projects
+./gradlew tasks
+./gradlew :app:build --dry-run
+./gradlew :app:build --info
+./gradlew dependencyInsight --dependency NAME --configuration CONFIGURATION
+```
+
+The first two establish the build's vocabulary, the dry run reveals task
+selection and ordering, `--info` explains incremental decisions, and
+`dependencyInsight` handles the separate problem of library resolution.
+`./gradlew properties` and `./gradlew :app:properties` are useful when the
+mystery is a project property or plugin-provided convention instead.
 
 ## Gradle vs. Maven: same dependency resolution, different everything else
 

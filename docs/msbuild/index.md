@@ -13,6 +13,41 @@ after has seen two wildly different amounts of XML for what's nominally the
 same job; that gap is the SDK-style rewrite, and it's worth understanding
 both what changed and why the underlying engine didn't.
 
+## The whole model in one page
+
+Before getting into the XML, separate the layers that one `dotnet build`
+command hides:
+
+```text
+dotnet CLI
+    │
+    ├── normally restore packages → obj/project.assets.json
+    │
+    └── invoke MSBuild
+            │
+            ├── evaluate the project and all imports
+            │       → properties and item lists
+            │
+            └── execute the requested target graph
+                    → tasks such as Csc, Copy, and Exec
+```
+
+The **.NET CLI** is the user-facing command. **MSBuild** is the engine. The
+`.csproj`, SDK files, NuGet-provided build files, and
+`Directory.Build.*` files are inputs to that engine. **NuGet restore**
+resolves packages and records their assets for MSBuild to consume (`--no-restore`
+skips the implicit restore when those assets are already current). Targets
+then arrange work, and tasks perform it.
+
+This gives unfamiliar errors somewhere to live:
+
+- a surprising property or missing file is usually an **evaluation** problem;
+- a target running in the wrong order is an **execution graph** problem;
+- a missing package assembly is often a **restore or asset-selection** problem;
+- a compiler diagnostic comes from the **task** MSBuild eventually invoked.
+
+The rest of the chapter opens each box in that diagram.
+
 ## A .csproj is a build graph, not project metadata
 
 The pre-2017 `.csproj` listed every source file explicitly:
@@ -179,9 +214,8 @@ values.
 
 The consequence that catches people: a `<PropertyGroup>` or item
 modification written *inside a target* only exists during execution, and
-can't retroactively change something whose value was already locked in
-during evaluation, even though both look like ordinary XML sitting in the
-same file:
+can't retroactively change an item whose condition was decided during
+evaluation, even though both look like ordinary XML in the same file:
 
 ```xml
 <PropertyGroup>
@@ -189,30 +223,70 @@ same file:
 </PropertyGroup>
 
 <ItemGroup>
-  <Compile Include="Extra.cs" Condition="'$(IncludeExtra)' == 'true'" />
+  <ReportInput Include="Extra.txt"
+               Condition="'$(IncludeExtra)' == 'true'" />
 </ItemGroup>
 
-<Target Name="EnableExtra" BeforeTargets="Build">
+<Target Name="EnableExtraAndReport" BeforeTargets="Build">
   <PropertyGroup>
     <IncludeExtra>true</IncludeExtra>
   </PropertyGroup>
+  <Message Text="Report inputs: @(ReportInput)" Importance="high" />
 </Target>
 ```
 
-This looks like it should include `Extra.cs`: `EnableExtra` sets
-`IncludeExtra` to `true`, and `BeforeTargets="Build"` guarantees it runs
-before the build proper starts. It doesn't. The `Compile` item's
-`Condition` was already evaluated, against `IncludeExtra`'s
-document-order value of `false`, during the evaluation pass — before any
-target, including `EnableExtra`, has run at all. `Extra.cs` is
-permanently absent from `@(Compile)` for this build, and nothing in a
-normal build log calls that out as a mistake, because as far as
-evaluation was concerned, the condition was simply false. The fix isn't
-a different target hook — it's moving `IncludeExtra`'s real value
-somewhere evaluation can see it before the item is expanded (a
-`-property:IncludeExtra=true` command-line switch, or an `<Import>`
-ordered earlier in the file), because no `BeforeTargets` placement can
-run early enough to matter.
+This looks like it should print `Extra.txt`: the target sets
+`IncludeExtra` to `true` before its `Message` task reads `@(ReportInput)`.
+It prints an empty list. `ReportInput`'s condition was already evaluated
+against the earlier value `false`, before any target ran. Changing the
+property during execution does not rewind evaluation and reconsider the
+item.
+
+Passing the value early enough produces the intended result:
+
+```console
+$ dotnet build -property:IncludeExtra=true
+  Report inputs: Extra.txt
+```
+
+The fix is not a different target hook. The real value must come from the
+command line or an earlier property/import so evaluation can see it when
+the item is created.
+
+### Properties overwrite; items accumulate
+
+Document order affects properties and items differently. A later property
+assignment normally replaces the earlier value:
+
+```xml
+<PropertyGroup>
+  <ConfigurationName>First</ConfigurationName>
+  <ConfigurationName>Second</ConfigurationName>
+</PropertyGroup>
+```
+
+`$(ConfigurationName)` ends as `Second`. Items form lists, so repeated
+`Include` operations append:
+
+```xml
+<ReportInput Include="one.txt" />
+<ReportInput Include="two.txt" />
+```
+
+`@(ReportInput)` contains both files. `Remove` subtracts matching items and
+`Update` changes metadata on items already present. In an SDK-style project,
+changing metadata on an implicitly included source usually uses `Update`,
+not `Include`:
+
+```xml
+<Compile Update="Generated.cs">
+  <Visible>false</Visible>
+</Compile>
+```
+
+Using `Include="Generated.cs"` would try to add a second copy of a file the
+SDK's `**/*.cs` glob already included, producing the `NETSDK1022` duplicate
+item error.
 
 ## Targets form a graph too — just via imports, not a single file
 
@@ -227,6 +301,38 @@ in what order" — reading the `.csproj` alone tells you the project's own
 targets, not the full graph assembled from every SDK and package import,
 which is exactly why binary log inspection, not `.csproj` reading, is the
 real debugging tool once a build does something surprising.
+
+For a searchable text representation, preprocess the project:
+
+```console
+$ dotnet msbuild MyApp.csproj -preprocess:effective.xml
+```
+
+`effective.xml` expands the imports into one large file, with comments
+marking where each imported section came from. It answers "which definition
+did MSBuild evaluate, and in what order?" A binary log answers the different
+question "what happened while that evaluated project executed?" Search the
+preprocessed file for a property or target definition; use the binary log
+for task parameters, timings, and execution-time values.
+
+Modern MSBuild can also query evaluated state without temporary `Message`
+targets:
+
+```console
+$ dotnet msbuild MyApp.csproj -getProperty:TargetFramework,OutputPath
+{
+  "Properties": {
+    "TargetFramework": "net8.0",
+    "OutputPath": "bin/Debug/net8.0/"
+  }
+}
+
+$ dotnet msbuild MyApp.csproj -getItem:Compile
+```
+
+These commands inspect evaluation. If a property is assigned later inside a
+target, request that target too or use a binary log to observe its
+execution-time value.
 
 ## Items carry metadata, not just filenames
 
@@ -384,6 +490,7 @@ all output files are up-to-date`.
 
 ```xml
 <Target Name="GenerateVersionFile"
+        BeforeTargets="CoreCompile"
         Inputs="$(MSBuildProjectFile)"
         Outputs="$(IntermediateOutputPath)version.g.cs">
   <WriteLinesToFile File="$(IntermediateOutputPath)version.g.cs"
@@ -391,8 +498,11 @@ all output files are up-to-date`.
 </Target>
 ```
 
-Running the same build twice in a row, with `dotnet build -v:detailed`,
-shows exactly this decision being made and logged:
+`BeforeTargets="CoreCompile"` connects the custom target to the build graph.
+Without that hook—or a `DependsOnTargets` edge or an explicit
+`-target:GenerateVersionFile` request—declaring the target alone would not
+cause it to run. With the hook in place, two builds using
+`dotnet build -v:detailed` show the incremental decision:
 
 ```
 Building target "GenerateVersionFile" completely.
@@ -474,10 +584,12 @@ own node/process.
 
 This is a second, coarser dependency graph sitting above the
 target-level graph described earlier, and the two are easy to conflate:
-a `ProjectReference` guarantees project B finishes building before
-project A starts (so A can reference B's output DLL), but says nothing
-about ordering *within* either project's own targets. It's also where
-custom tasks that rely on process-wide static state get quietly broken —
+a `ProjectReference` makes the targets in A that consume B's output wait
+for the required targets in B. It does not mean every part of A waits for
+the whole of B: evaluation and work without that dependency may overlap,
+especially in a graph build. Nor does it specify ordering *within* either
+project's own target graph. This is also where custom tasks that rely on
+process-wide static state get quietly broken —
 a task that stashes something in a static field expecting a later target
 in the *same build* to read it can end up running in a different node
 process entirely once `/m` parallelizes across projects, with no shared
@@ -487,16 +599,29 @@ memory between them.
 
 `dotnet build` compiles and produces a runnable-in-place output —
 sufficient for local development, `dotnet run`, and F5 in an IDE. `dotnet
-publish` produces a self-contained deployable output: it resolves the full
-dependency closure needed to run outside the SDK's presence (or bundles a
-runtime entirely, for self-contained deployment), and applies
-publish-specific optimizations (trimming, ReadyToRun, single-file) that
-`build` intentionally skips because they're slow and unnecessary for an
-inner dev loop. Treating these as interchangeable — publishing what
-`dotnet build` produced, or expecting a CI `build` step's output to be
-deployable — is the most common MSBuild-adjacent deployment mistake, and
-it's a distinction the tool never hides, just one that's easy to skip past
-because both commands look similarly quick to type.
+publish` gathers a deployment-shaped directory: the application, its
+`.deps.json`/`.runtimeconfig.json`, content files, and selected dependency
+assets. By default this is **framework-dependent**—the destination still
+needs a compatible .NET runtime:
+
+```console
+$ dotnet publish -c Release
+# bin/Release/net8.0/publish/
+```
+
+A self-contained publish explicitly includes a runtime for one runtime
+identifier, making the output larger and platform-specific:
+
+```console
+$ dotnet publish -c Release -r linux-x64 --self-contained true
+# bin/Release/net8.0/linux-x64/publish/
+```
+
+Single-file, trimming, ReadyToRun, and native AOT are additional publish
+choices, not optimizations every publish automatically applies. `build`
+optimizes for the development loop; `publish` computes the output intended
+for deployment. Treating those outputs as interchangeable—copying a random
+`bin/Release` directory to production, for example—is the common mistake.
 
 `msbuild` the raw executable still exists underneath `dotnet build` and
 `dotnet publish` both — they're a friendlier CLI wrapper that sets the
@@ -504,6 +629,37 @@ right default properties and invokes the same engine. `dotnet build
 -property:Configuration=Release` and `msbuild -p:Configuration=Release` are
 doing the same underlying work; the `dotnet` CLI just exists so most .NET
 developers never need to know MSBuild's own command-line syntax at all.
+
+## A practical debugging sequence
+
+When a build is surprising, start with the cheapest observation that can
+answer the question:
+
+```console
+# What value or item list did evaluation produce?
+dotnet msbuild MyApp.csproj -getProperty:OutputPath
+dotnet msbuild MyApp.csproj -getItem:Compile
+
+# Which imported file assigned or defined it?
+dotnet msbuild MyApp.csproj -preprocess:effective.xml
+
+# Which targets and tasks actually ran?
+dotnet build MyApp.csproj -bl:build.binlog
+
+# Why was an incremental target run or skipped?
+dotnet build MyApp.csproj -verbosity:detailed
+```
+
+Open `build.binlog` in MSBuild Structured Log Viewer and search for the
+property, item, target, task, or error code. The viewer reconstructs the
+evaluation and execution trees and is normally more useful than increasing
+console verbosity to `diagnostic`, whose interleaved output becomes
+difficult to follow in a parallel build.
+
+For a clean-room comparison, remove `bin/` and `obj/` and rebuild—but do not
+make that the permanent remedy. If cleaning fixes the build, the useful
+next question is which target failed to declare or refresh the intermediate
+state that made cleaning necessary.
 
 ## Where people actually get burned
 
@@ -553,11 +709,19 @@ developers never need to know MSBuild's own command-line syntax at all.
   <PackageReference Include="Newtonsoft.Json" />
   ```
 
-  It's easy to half-migrate a solution, leaving some projects still
-  specifying their own `Version` on `PackageReference` — MSBuild doesn't
-  reject that as a conflict, it silently lets the per-project `Version`
-  override the central pin, which defeats the entire point of centralizing
-  it in the first place without ever raising an error.
+  A half-migrated project that retains `Version="13.0.3"` on
+  `PackageReference` does not silently win: restore reports `NU1008` and
+  tells you to move the version to `PackageVersion`. An intentional
+  exception uses `VersionOverride`:
+
+  ```xml
+  <PackageReference Include="Newtonsoft.Json"
+                    VersionOverride="13.0.4" />
+  ```
+
+  Repositories can disable overrides with
+  `<CentralPackageVersionOverrideEnabled>false</CentralPackageVersionOverrideEnabled>`
+  when the central pin is meant to be absolute.
 - **`Directory.Build.props`/`Directory.Build.targets`** are auto-imported by
   every project below them in the directory tree, with no explicit
   `<Import>` needed:

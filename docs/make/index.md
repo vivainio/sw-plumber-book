@@ -48,6 +48,28 @@ app` again — only `utils.o` rebuilds, then the link step reruns, because
 build story: **file modification timestamps compared along an explicit
 dependency graph.**
 
+Make narrates that traversal by printing each recipe before it runs:
+
+```console
+$ make app
+gcc -c main.c
+gcc -c utils.c
+gcc -o app main.o utils.o
+
+$ make app
+make: 'app' is up to date.
+
+$ touch utils.c
+$ make app
+gcc -c utils.c
+gcc -o app main.o utils.o
+```
+
+That output is often the fastest explanation of a build. If the wrong flag
+appears, inspect the printed command. If a recipe does not appear at all,
+the problem is in the graph or Make's up-to-date decision, not in the
+recipe.
+
 That one sentence is worth sitting with, because it's also where Make's
 sharp edges come from. Timestamps are a proxy for "did the meaningful
 content change," and proxies leak: `touch main.c` with no content change
@@ -82,6 +104,21 @@ Nearly every real-world makefile has a `.PHONY` line near the top, and it's
 there for exactly this reason — not style, a correctness fix for the
 fact that Make's only notion of "already done" is a file on disk.
 
+The first ordinary target is the default goal, so `make` without an argument
+builds it. Projects commonly make that choice explicit with an aggregate
+phony target:
+
+```makefile
+.DEFAULT_GOAL := all
+.PHONY: all clean test
+
+all: app
+```
+
+`all` has no recipe. Its job is to name a set of prerequisites. Because it
+is phony, Make considers it on every invocation, then discovers whether its
+real prerequisites need work.
+
 ## Variables and pattern rules
 
 Hand-writing a rule per source file doesn't scale. Pattern rules generalize
@@ -106,6 +143,102 @@ newcomer's eyes glaze over reading an unfamiliar makefile, and it's worth
 learning deliberately rather than pattern-matching from examples, because
 `$<`, `$@`, `$^`, and `$*` all mean different things and get shuffled
 constantly in copy-pasted snippets.
+
+| Variable | Meaning in the current rule |
+| --- | --- |
+| `$@` | target name |
+| `$<` | first prerequisite |
+| `$^` | all prerequisites, with duplicates removed |
+| `$*` | stem matched by a pattern rule |
+
+They only have meaning in the context of a rule. Outside one, there is no
+current target for `$@` to name.
+
+Make's two common assignment operators also differ in *when* they expand:
+
+```makefile
+mode = debug
+recursive = $(mode)     # expanded when recursive is used
+simple := $(mode)       # expanded now
+mode = release
+```
+
+After these lines, `$(recursive)` is `release` and `$(simple)` is `debug`.
+When a variable mysteriously observes a later value—or repeatedly executes
+an expensive `$(shell ...)`—checking the assignment form often explains it.
+
+## The shell boundary
+
+By default, each logical recipe line runs in a separate shell:
+
+```makefile
+broken:
+	cd build
+	./configure
+```
+
+The `cd` disappears with its shell; `./configure` runs from the original
+directory. Commands that must share shell state belong on one logical line
+(or in a deliberately enabled `.ONESHELL` recipe):
+
+```makefile
+fixed:
+	cd build && ./configure
+```
+
+The boundary also explains doubled dollar signs:
+
+```makefile
+show-home:
+	@echo "$$HOME"
+```
+
+Make consumes one layer and passes `$HOME` to the shell. `$(HOME)` instead
+asks Make to expand a Make variable. They may happen to contain the same
+value, which is why confusing them can go unnoticed.
+
+## Parallel builds expose missing edges
+
+`make -j8` may run eight independent recipes concurrently. It does not
+change the graph; it merely stops serial execution from hiding missing
+dependencies. If generated `version.h` is included by `main.c`, but
+`main.o` does not name it as a prerequisite, a one-job build might create
+the header first by coincidence. A parallel build may compile too early.
+
+Describe the real edge:
+
+```makefile
+main.o: main.c version.h
+
+version.h:
+	./generate-version > $@
+```
+
+If a build fails only under `-j`, treat that as evidence that the declared
+graph differs from the real one, not as proof that parallel Make is
+unreliable.
+
+## Asking Make what it believes
+
+Several options turn a confusing build into a smaller question:
+
+```console
+$ make -n app
+gcc -c main.c
+gcc -c utils.c
+gcc -o app main.o utils.o
+
+$ make --trace app
+Makefile:8: update target 'main.o' due to: main.c utils.h
+gcc -c main.c
+```
+
+`-n` prints recipes without running them. `--trace` states which rule and
+prerequisite caused an update. `make -p` prints Make's entire internal
+database—variables, implicit rules, and targets—which is noisy but decisive
+when you need the value Make actually sees. `make -B` forces selected
+targets to rebuild; it is a diagnostic escape hatch, not a cure for an
+incomplete prerequisite list.
 
 ## Recursive Make, and why it's controversial
 

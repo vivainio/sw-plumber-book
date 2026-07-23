@@ -37,6 +37,22 @@ feature: a `postinstall` script runs arbitrary code on every machine that
 installs the package, with no sandboxing, which is the mechanism behind a
 meaningful share of supply-chain npm incidents.
 
+The package manager adds `node_modules/.bin` to `PATH` while running a
+script. That is why the script can say `tsc` and use the project-pinned
+TypeScript rather than an unrelated global installation. Arguments after
+`--` are forwarded to the underlying command:
+
+```console
+$ npm run test -- --watch
+
+> example@1.0.0 test
+> vitest run --watch
+```
+
+Scripts can call one another with `npm run`, but npm does not infer a graph
+from those calls. If `build` must happen before `package`, the author must
+encode that order or use a separate task runner.
+
 ## node_modules resolution: why nesting existed and why it stopped
 
 Node's `require()`/`import` resolution walks up the directory tree looking
@@ -128,6 +144,101 @@ interchangeable, and none of the tools reliably reads another's lockfile —
 switching package managers in an existing project means regenerating the
 lockfile from scratch and treating any dependency version *drift* that
 surfaces as expected, not a bug in the new tool.
+
+## `install` versus a frozen install
+
+`npm install` treats `package.json` as something it may reconcile with
+`package-lock.json`; changing dependencies can update the lockfile.
+`npm ci` instead requires the committed lockfile to agree with
+`package.json`. It removes the existing `node_modules`, installs the locked
+tree, and fails rather than rewriting the lockfile:
+
+```console
+$ npm ci
+npm error `npm ci` can only install packages when your package.json and
+npm error package-lock.json are in sync.
+```
+
+That makes `npm ci` the usual CI command: a mismatch is reported where
+reproducibility matters instead of being repaired on a runner. pnpm and Yarn
+have corresponding frozen or immutable lockfile modes; the spelling differs,
+but the invariant is the same.
+
+## Version ranges are constraints, not installed versions
+
+```json
+{
+  "dependencies": {
+    "exact": "1.2.3",
+    "compatible-minor": "~1.2.3",
+    "compatible-major": "^1.2.3"
+  }
+}
+```
+
+For an ordinary `1.2.3` release, `~1.2.3` admits patches below `1.3.0`;
+`^1.2.3` admits minor and patch releases below `2.0.0`. The lockfile records
+the exact version selected from that set. This separates two decisions:
+
+- changing a range changes what future resolutions may choose;
+- changing a lockfile entry changes what this repository installs now.
+
+`npm outdated` compares declared ranges, installed versions, and registry
+versions. `npm update` selects newer versions that still fit the ranges; it
+does not automatically turn `^1` into `^2`.
+
+## Dependency categories describe who needs what
+
+`dependencies` are needed at runtime. `devDependencies` are needed to
+develop or build the package. The distinction matters most for a published
+library or production-only install; a frontend application may bundle
+everything before deployment, so its server runtime may not involve npm.
+
+A `peerDependency` says "my consumer must provide a compatible instance":
+
+```json
+{
+  "peerDependencies": {
+    "react": "^19.0.0"
+  }
+}
+```
+
+A plugin needs to participate in the application's React installation
+rather than privately choosing another copy. Peer-dependency errors are
+therefore compatibility errors, not merely missing downloads.
+`optionalDependencies` name packages whose installation may fail without
+failing the entire install, often for platform-specific enhancements.
+
+## Reading the installed graph
+
+When an import resolves to a surprising version, inspect what was installed:
+
+```console
+$ npm ls react
+example@1.0.0
+├─┬ component-library@3.0.0
+│ └── react@19.1.0 deduped
+└── react@19.1.0
+
+$ npm explain react
+react@19.1.0
+node_modules/react
+  react@"^19.0.0" from the root project
+  peer react@"^19.0.0" from component-library@3.0.0
+```
+
+`npm ls` answers where a package appears; `npm explain` answers which
+relationships caused that copy to be installed. Node can answer the final,
+file-level resolution question:
+
+```console
+$ node -p "require.resolve('react/package.json')"
+/work/example/node_modules/react/package.json
+```
+
+Together these separate what the manifest permits, what the lockfile
+selected, and which physical package Node resolves.
 
 ## Workspaces: one lockfile, many packages
 
