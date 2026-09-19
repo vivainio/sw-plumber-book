@@ -34,6 +34,11 @@ nav = [
   { "CI/CD Pipelines" = "cicd-pipelines/index.md" },
   { "Debuggers" = "debuggers/index.md" },
   { "Containers" = "containers/index.md" },
+  { "Security" = [
+      "security/index.md",
+      { "Linux Kernel Keyrings" = "security/linux-keyrings.md" },
+    ]
+  },
   { "OpenTelemetry" = [
       "opentelemetry/index.md",
       { "Traces and Context Propagation" = "opentelemetry/traces-and-context.md" },

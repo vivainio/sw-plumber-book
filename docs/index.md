@@ -73,6 +73,11 @@ are welcome [in the issues](https://github.com/vivainio/sw-plumber-book/issues).
   why they're not lightweight VMs, and where Docker, containerd, and
   `runc` each fit in the stack.
 
+### Security
+
+- [Security](security/index.md) — cryptographic storage and operating system
+  access controls, starting with [Linux kernel keyrings](security/linux-keyrings.md).
+
 More chapters are planned here — profilers, linkers/loaders, and the
 other OS primitives underneath them. See the open issues for what's
 queued.
