@@ -4,39 +4,42 @@ icon: lucide/box-select
 
 # Bazel
 
-Every build tool earlier in this book answers "what needs to rerun?" by
-comparing timestamps or, at best, hashing a few known inputs. Bazel
+The build tools earlier in this book answer "what needs to rerun?" using
+timestamps or hashes of declared inputs. Bazel
 (Google's internal "Blaze," open-sourced in 2015) answers a stricter
-question: given the *exact* set of inputs a step depends on — every file,
-every environment variable, every tool version, and nothing else — has
-that exact set changed? Getting that question right requires refusing to
-let a build step see anything it didn't declare, which is a fundamentally
-different posture than Make (any recipe can shell out and read whatever
-it wants) or Gradle (dependencies are declared, but a task body is
-arbitrary Groovy/Kotlin that can still reach outside its declared inputs).
-Bazel calls the property **hermeticity**, and almost every unusual thing
-about it — the sandboxing, the Starlark language restrictions, the
-insistence on declaring every dependency explicitly — exists in service
-of that one property.
+question: given the declared inputs and execution environment of a step,
+has anything relevant changed? Getting that question right means trying
+to prevent a build step from observing undeclared state, which is a
+fundamentally different posture than Make (a recipe can shell out and read
+whatever it wants) or Gradle (a task body is arbitrary Groovy/Kotlin and
+can reach outside its declared inputs). Bazel calls the desired property
+**hermeticity**, and almost every unusual thing about it — sandboxing,
+restricted build-definition languages, explicit dependencies, and
+registered toolchains — exists in service of that property. Bazel makes
+hermetic builds possible and strongly encourages them; a poorly written
+rule or action can still introduce undeclared inputs.
 
 ## Actions, not tasks
 
-Gradle and MSBuild build a graph of *tasks*: named, user-visible units of
-work with imperative bodies. Bazel builds a graph of **actions**: a
-command line, an explicit list of input files, and an explicit list of
-output files, with no other implicit inputs allowed. A `cc_library` rule
-doesn't run "the compile task" — it generates one action per source file,
-each one exactly `gcc -c foo.c -o foo.o` (roughly) plus the precise set of
-headers, flags, and toolchain files that action is allowed to see.
+Gradle and MSBuild expose graphs of *tasks*: named, user-visible units of
+work that may have imperative bodies. Bazel rules analyze into
+**actions**: commands with declared inputs and outputs. A `cc_library`
+doesn't run one monolithic "compile task" — it normally generates a
+compile action for each source file, plus linking or archiving actions as
+needed. Those actions include compiler arguments, headers, toolchain
+files, environment variables selected for the action, and other
+rule-specific inputs.
 
-The **action key** is a hash of the command line and every declared
-input's content — not its timestamp, its actual hash. If that key has
-been computed before, on this machine or a remote cache, Bazel skips
-running the action entirely and fetches the output instead. This is why
-Bazel remote caching works across completely different machines with no
-shared filesystem or clock: cache lookup is content-addressed, so two
-unrelated machines building identical inputs land on the same key and one
-can serve the other's result.
+Bazel's cache identity incorporates the action definition and the
+contents of its inputs, rather than relying on file timestamps. The exact
+key includes details such as arguments, selected environment variables,
+execution properties, and input digests; thinking of it as "the hash of
+everything relevant to this action" is more useful than memorizing an
+implementation-specific formula. If an identical result exists locally
+or in a remote cache, Bazel can skip execution and reuse it. This is why
+remote caching works across machines with no shared filesystem or clock:
+two machines presenting the same action and input contents arrive at the
+same cache identity.
 
 ## BUILD files, targets, and labels
 
@@ -60,47 +63,54 @@ cc_binary(
 )
 ```
 
-Every target has a **label** — `//src/mylib:mylib` — that's globally
-unique across the whole workspace, unlike a Makefile's targets, which
-only mean something relative to the makefile that defined them. `deps =
-["//src/utils:utils"]` is not a suggestion or a classpath entry; it's the
-entire universe of what `mylib.c`'s compile action is allowed to read
-besides its own declared `srcs`/`hdrs`. Miss a header out of `hdrs` and
-the build doesn't quietly work anyway the way it would with Make — it
-fails, because the sandbox (next) never made that header visible in the
-first place.
+Every target has a **label** — `//src/mylib:mylib` — that's unique within
+its repository, unlike a Makefile target whose meaning is tied to the
+makefile that defined it. The `//` starts at the repository root,
+`src/mylib` is the package, and the name after `:` is the target. Inside
+the same package, `:mylib` is shorthand for the full label.
+
+`deps = ["//src/utils:utils"]` declares a target-level dependency, not an
+arbitrary classpath or include-path hint. Along with `srcs`, `hdrs`,
+generated inputs, the selected toolchain, and rule-specific implicit
+dependencies, it determines the inputs of the resulting actions. If code
+uses a dependency that the rule did not declare, a correctly implemented
+rule and sandboxed build should expose the mistake rather than succeeding
+because of an accidental filesystem or classpath layout.
 
 ## Sandboxing: enforcing hermeticity, not just hoping for it
 
-Declaring inputs is worthless if a compiler can still `#include` a header
-that happens to sit in the same directory but was never declared. Bazel
-enforces the declaration by running each action inside a **sandbox**: a
-symlink forest containing *only* the declared inputs, nothing else from
-the real source tree. If `mylib.c` `#include`s a header nobody listed in
-`hdrs`/`deps`, the compile fails with a file-not-found error even though
-the header exists two directories up in the real checkout — because the
-sandboxed view of the filesystem never included it. This is the single
-biggest source of friction migrating an existing C++ or Java project to
-Bazel: undeclared dependencies that "worked" for years under Make or
-Maven, because the compiler's working directory happened to make them
-visible, all surface at once as build failures. It's also exactly the
-point — those were latent bugs (a build that only works because of
-directory layout accidents) that Bazel refuses to let pass silently.
+Declaring inputs is of limited value if a compiler can still read a header
+that was never declared. Bazel therefore offers **sandboxed execution
+strategies**. Depending on the operating system and selected strategy, an
+action runs in an isolated working directory populated with its known
+inputs, with additional operating-system restrictions where available.
+This is stricter than merely running a command in the checkout.
+
+Sandboxing is not one identical mechanism on every platform, nor does it
+magically repair an incorrectly implemented rule. Some tools also use
+input discovery, such as discovering included C/C++ headers, before the
+final action inputs are known. The practical goal remains the same:
+undeclared dependencies should fail locally instead of surviving until a
+remote build or a different checkout happens not to contain them.
+Surfacing those dependencies is a major source of friction when migrating
+an existing project—and one of the main benefits.
 
 ## Starlark: a deliberately restricted language
 
 `BUILD` files and `.bzl` macro/rule definitions are written in
-**Starlark**, a dialect of Python with entire features removed: no
-classes, no unbounded loops without a fixed iteration limit, no I/O, no
-`import` of arbitrary modules, no mutable global state visible across
-evaluations. None of this is arbitrary austerity — every removed feature
-is a way a build file could otherwise produce different output on
-different machines or different runs (reading the current time, hitting
-the network, depending on dict iteration order in old Python). A language
-that can't do those things is a language whose evaluation is safe to
-cache, safe to run in parallel, and safe to distribute — the same
-hermeticity goal, applied to the build *description* instead of just the
-build *actions*.
+**Starlark**, a language with Python-like syntax but deliberately fewer
+ways to observe or mutate the outside world. There is no arbitrary module
+import, file I/O, network access, `while` loop, or recursion. `.bzl` files
+can define functions and iterate with `for`; the more declarative
+`BUILD`-file dialect disallows `def`, `for`, and statement-form `if`
+(comprehensions and conditional expressions are still available).
+Module-level values are frozen after loading, preventing mutable global
+state from leaking between evaluations.
+
+These restrictions make loading and analysis deterministic enough to
+cache and parallelize. Starlark constrains the build *description*;
+sandboxing and carefully designed rules constrain the actions that
+description creates.
 
 ## Remote execution: sandboxing pays off twice
 
@@ -119,24 +129,87 @@ rest across machines instead of one CI runner's core count.
 
 ## Dependency management: WORKSPACE, and its replacement
 
-External dependencies (other repositories, prebuilt archives, other
-package ecosystems) were historically declared in a `WORKSPACE` file with
-manually-specified download URLs and content hashes — hermetic in the
-same sense as everything else (a pinned hash, not a floating version) but
-notoriously bad at resolving version conflicts between transitive
-dependencies, since `WORKSPACE` had no real resolution algorithm, just
-first-one-wins. **Bzlmod** (`MODULE.bazel`), Bazel's newer dependency
-system, replaces this with real version resolution (minimal version
-selection, similar in spirit to Go modules) while keeping the same
-underlying hermeticity guarantee — every resolved dependency still
-bottoms out in a content hash, just arrived at through an actual
-algorithm instead of file-declaration order.
+External repositories were historically created from a `WORKSPACE` file
+using repository rules such as `http_archive`. `WORKSPACE` evaluation is
+ordered and repository names must be coordinated globally; it was not a
+general module system with a standard transitive version-resolution
+algorithm. Reusable rule sets consequently grew their own conventions
+for declaring repositories and avoiding name or version conflicts.
+
+**Bzlmod**, configured in `MODULE.bazel`, is the current module system and
+the replacement for the legacy `WORKSPACE` mechanism. It resolves a
+module graph using **minimal version selection**: despite the name, when
+several versions of a module at the same compatibility level are
+requested, the highest requested version normally wins. Registries and
+lockfiles make resolution reproducible, while archive integrity hashes
+can verify downloaded content. Not every repository is literally a
+hashed download—local path overrides and module extensions exist—so
+hermeticity still depends on how a dependency is obtained.
+
+## A small working repository
+
+The quickest way to turn those concepts into muscle memory is to build a
+tiny project. Pin Bazel itself for the repository—usually with Bazelisk
+and a checked-in `.bazelversion`—then create a module:
+
+```python
+# MODULE.bazel
+module(name = "hello")
+```
+
+Add a source file and target:
+
+```python
+# hello/BUILD.bazel
+cc_binary(
+    name = "hello",
+    srcs = ["hello.cc"],
+)
+```
+
+```cpp
+// hello/hello.cc
+#include <iostream>
+
+int main() {
+    std::cout << "hello\n";
+}
+```
+
+The core commands operate on labels:
+
+```sh
+bazel build //hello:hello     # build one target
+bazel run //hello:hello       # build it, then run it
+bazel test //...              # test every package below the repository root
+```
+
+`//hello:hello` is the target; `//hello` is commonly accepted as shorthand
+when the target name matches the final package segment; `//...` is a
+recursive target pattern. Build outputs appear through convenience
+symlinks such as `bazel-bin`, backed by Bazel's output tree. Treat those
+paths as outputs, not as source directories to edit.
+
+When a build surprises you, inspect progressively deeper layers:
+
+```sh
+bazel query 'deps(//hello:hello)'   # unconfigured target graph
+bazel cquery //hello:hello          # configured targets after select/toolchains
+bazel aquery //hello:hello          # generated actions, inputs, and arguments
+bazel clean                         # discard outputs; rarely the first remedy
+```
+
+`query` answers structural questions quickly. `cquery` includes the
+configuration chosen for a particular build. `aquery` reaches the action
+level and is the useful one when asking “what command will run?” or “why
+is this file an input?” A normal cache or dependency problem should be
+diagnosed before reaching for `clean`; deleting all outputs removes the
+evidence as well as the cache.
 
 ## Introspecting the graph: `bazel query`
 
-Because the entire dependency graph is explicit — no step can have a
-dependency it didn't declare — it's also fully queryable, not just
-executable:
+Because Bazel represents the declared dependency graph explicitly, it is
+queryable independently of executing a build:
 
 ```sh
 bazel query 'deps(//src/mylib:app)'
@@ -144,22 +217,25 @@ bazel query 'rdeps(//..., //src/utils:utils)'   # what depends on utils?
 bazel query 'somepath(//src/mylib:app, //src/legacy:old_lib)'
 ```
 
-`rdeps` (reverse dependencies) answers "what breaks if I change this
-target?" directly from the graph, before running any build at all — a
-question Make or Gradle can only answer by grepping build files by hand,
-since neither maintains the graph as a first-class, query-able structure
-independent of actually executing it.
+`rdeps` (reverse dependencies) answers "what declares a dependency on
+this target?" before running a build. That is not exactly the same as
+"what will break?"—behavioral effects can escape the declared graph—but
+it is a powerful approximation. Other build tools expose pieces of their
+task or dependency graphs too; Bazel's advantage is a uniform query
+language over a repository-wide target graph, plus `cquery` and `aquery`
+for its configured and action-level forms.
 
 ## Why the friction is usually the point
 
 Bazel has a reputation for being heavyweight to adopt, and the reputation
-is earned: every external dependency needs an explicit, hashed
-declaration, every target needs accurate `deps`, and there's no
-"reasonable default" escape hatch the way Make lets a recipe just shell
-out to whatever's on `$PATH`. That friction is the hermeticity property
+is earned: external dependencies and toolchains need reproducible
+definitions, targets need accurate `deps`, and arbitrary shell commands
+must be wrapped in actions whose inputs and outputs Bazel understands.
+That friction is the hermeticity property
 showing up at build-file-authoring time instead of at "why did this build
 break on a different machine" time — the same correctness Make and
 Gradle chapters described as their sharp edges (timestamps as a leaky
 proxy, task bodies with unchecked side effects) is what Bazel spends its
-extra ceremony to close off entirely, at the cost of never being the
-quick, no-config option for a small project that a `Makefile` still is.
+extra ceremony to constrain. The payoff is strongest in large,
+multi-language repositories and shared CI; for a small project, a
+`Makefile` may remain the clearer and cheaper choice.

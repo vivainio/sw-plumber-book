@@ -52,6 +52,69 @@ need afterward. In particular, granting link or permission-changing rights
 to every descendant lets those descendants broaden access.
 [keyctl_setperm(3)](https://man7.org/linux/man-pages/man3/keyctl_setperm.3.html)
 
+## User keyrings: keys shared by your normal account
+
+Each UID has a **user keyring**, addressed as `@u` by `keyctl` or
+`KEY_SPEC_USER_KEYRING` (`-4`) by the API. Programs running as your normal
+local user can use it across independent shells and application launches.
+No dedicated service account or common launcher is required. Search `@u`
+explicitly: automatic key lookup does not always include it, although PAM
+commonly links it into a login's session keyring.
+[user-keyring(7)](https://man7.org/linux/man-pages/man7/user-keyring.7.html)
+
+The **key type** `user` and the **user keyring** are separate concepts.
+`user` describes a payload that userspace can read; `@u` selects where its
+reference is stored. A key of type `user` can also be stored in `@s`.
+
+Sharing a ring does not override the permissions of the keys inside it.
+For access based on your UID, give the key owner the necessary rights and
+remove possessor, group, and other grants. With ordinary process credentials,
+the owner check matches your UID; more precisely it uses the caller's
+filesystem UID. The kernel already knows this identity, so retrieving the
+key needs no additional application password. This authorizes access using
+an existing OS identity; it does not authenticate a remote party.
+
+Here is a disposable example using the `keyutils` CLI. Run it as your normal
+user. It prints demonstration data, never a real credential:
+
+```bash
+user_demo_id=$(printf '%s' 'example-only' | keyctl padd user plumbers:uid-demo @u)
+keyctl setperm "$user_demo_id" 0x003f0000
+
+# This also works in another ordinary shell under the same UID.
+keyctl pipe "$(keyctl search @u user plumbers:uid-demo)"
+printf '\n'
+
+# Remove this demonstration key when finished.
+keyctl revoke "$user_demo_id"
+keyctl unlink "$user_demo_id" @u
+```
+
+`0x003f0000` grants all six rights to the owner only, including permission
+to manage and revoke the example key. Other permission classes grant
+nothing. This deliberately trusts all programs running as you; it does
+not distinguish a trusted editor from an untrusted script under your
+account. Avoid changing permissions on the entire shared `@u` ring merely
+to configure one application's key.
+[keyctl_setperm(3)](https://man7.org/linux/man-pages/man3/keyctl_setperm.3.html)
+
+| Anchor | Intended sharing |
+| --- | --- |
+| `@u`: user keyring | Programs with the same UID, subject to key permissions |
+| `@s`: session keyring | Processes sharing an inherited or explicitly joined subscription |
+| `@us`: user session keyring | Per-UID fallback when a process lacks its own session keyring |
+
+`@us` is distinct from `@u`; it provides a default session anchor rather
+than another name for the user keyring.
+[user-session-keyring(7)](https://man7.org/linux/man-pages/man7/user-session-keyring.7.html)
+
+The user keyring is held only in kernel memory; it is not saved to disk.
+Rebooting loses it. Closing one terminal usually leaves it available to
+other running processes under your account. After the keyring is gone,
+applications must load their keys again to decrypt existing data. Root or
+an administrator controlling the host is outside this protection.
+
+
 ## Try the inheritance with a disposable value
 
 On Ubuntu or Debian, install the `keyutils` package for the `keyctl` CLI.
